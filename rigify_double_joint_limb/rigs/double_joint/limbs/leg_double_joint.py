@@ -188,5 +188,11 @@ def create_sample(obj):
     lower.head = joint.tail.copy()
     lower.use_connect = True
 
+    # Salin bone collection dari shin ke knee agar sendi terlihat
+    # pada layer yang sama di Blender 4.x Bone Collections system
+    for collection in lower.collections:
+        collection.assign(joint)
+
     bpy.ops.object.mode_set(mode="OBJECT")
     obj.pose.bones["thigh.L"].rigify_type = "double_joint.limbs.leg_double_joint"
+

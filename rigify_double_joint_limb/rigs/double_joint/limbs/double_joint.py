@@ -1,12 +1,17 @@
 # SPDX-FileCopyrightText: 2026 MiKy LiRa
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import bpy
 from itertools import count
 
+from rigify.base_generate import BaseGenerator
+from rigify.base_rig import stage
 from rigify.rigs.limbs.limb_rigs import BaseLimbRig, SegmentEntry
 from rigify.utils.bones import put_bone
 from rigify.utils.misc import map_list, padnone
 from rigify.utils.naming import make_derived_name
+from rigify.utils.widgets import GeometryData
+from rigify.utils.widgets_basic import create_circle_widget, create_limb_widget
 
 
 class DoubleJointLimbMixin:
@@ -21,6 +26,16 @@ class DoubleJointLimbMixin:
         self.fk_name_suffix_cutoff = self.end_index
         self.fk_ik_layer_cutoff = self.end_index + 1
         self._build_double_joint_segment_tables()
+
+    @stage.generate_bones
+    def generate_bones(self):
+        orgs = self.bones.org.main
+        # Gunakan bone upper dan lower (bukan intermediate joint) untuk menghitung arah siku/lutut dan pole angle
+        bones = [self.get_bone(orgs[0]), self.get_bone(orgs[self.lower_index])]
+
+        self.elbow_vector = self.compute_elbow_vector(bones)
+        self.pole_angle = self.compute_pole_angle(bones, self.elbow_vector)
+        self.rig_parent_bone = self.get_bone_parent(orgs[0])
 
     def _build_double_joint_segment_tables(self):
         orgs = self.bones.org.main
@@ -64,8 +79,45 @@ class DoubleJointLimbMixin:
     def configure_fk_control_bone(self, i: int, ctrl: str, org: str):
         self.copy_bone_properties(org, ctrl)
 
-        if i == self.end_index:
+        # Bone FK selain root hanya boleh berotasi; kunci translasi lokal agar animator
+        # tidak menggeser bone ini secara tidak sengaja (G key di Pose Mode).
+        if i > 0:
             self.get_bone(ctrl).lock_location = True, True, True
+
+    def make_fk_control_widget(self, i: int, ctrl: str):
+        if i < self.end_index:
+            obj = create_limb_widget(self.obj, ctrl)
+            func = create_limb_widget.__wrapped__
+            kwargs = {}
+        elif i == self.end_index:
+            obj = create_circle_widget(self.obj, ctrl, radius=0.4, head_tail=0.0)
+            func = create_circle_widget.__wrapped__
+            kwargs = {"radius": 0.4, "head_tail": 0.0}
+        else:
+            obj = create_circle_widget(self.obj, ctrl, radius=0.4, head_tail=0.5)
+            func = create_circle_widget.__wrapped__
+            kwargs = {"radius": 0.4, "head_tail": 0.5}
+
+        # Rigify mempertahankan objek widget lama jika sudah ada di scene saat re-generate,
+        # sehingga mesh lama (misal circle lama di pergelangan/telapak) tidak otomatis diperbarui.
+        # Jika obj is None, kita paksa perbarui data mesh-nya dengan geometri yang benar.
+        if obj is None:
+            generator = BaseGenerator.instance
+            wgt_obj = None
+            if generator:
+                wgt_obj = generator.new_widget_table.get(ctrl)
+            if not wgt_obj:
+                wgt_name = f"WGT-{self.obj.name}_{ctrl}"
+                wgt_obj = bpy.context.scene.objects.get(wgt_name)
+
+            if wgt_obj and hasattr(wgt_obj, "data") and wgt_obj.data:
+                geom = GeometryData()
+                func(geom, **kwargs)
+                mesh = wgt_obj.data
+                mesh.clear_geometry()
+                mesh.from_pydata(geom.verts, geom.edges, geom.faces)
+                mesh.update()
+
 
     def make_ik_control_bone(self, orgs: list[str]):
         org = orgs[self.end_index]
@@ -123,9 +175,10 @@ class DoubleJointLimbMixin:
         self.set_bone_parent(mch.ik_end, mch.ik_mid, use_connect=True)
 
     def configure_ik_mch_chain(self):
-        for bone_name in self.get_ik_output_chain()[:-1]:
-            bone = self.get_bone(bone_name)
-            bone.ik_stretch = 0.1
+        for bone_name in (self.get_ik_chain_base(), self.bones.mch.ik_end):
+            self.get_bone(bone_name).ik_stretch = 0.1
+
+        self.get_bone(self.bones.mch.ik_mid).ik_stretch = 0.0
 
         for bone_name in (self.bones.mch.ik_mid, self.bones.mch.ik_end):
             bone = self.get_bone(bone_name)
@@ -143,6 +196,7 @@ class DoubleJointLimbMixin:
             input_bone,
             self.ik_input_head_tail,
             self.ik_chain_count,
+            bias=1.0,
         )
         self.rig_ik_mch_end_bone(
             mch.ik_end,
@@ -150,6 +204,20 @@ class DoubleJointLimbMixin:
             self.bones.ctrl.ik_pole,
             chain=self.ik_chain_count,
         )
+
+    def rig_tweak_mch_bone(self, i: int, tweak: str, entry: SegmentEntry):
+        if entry.seg_idx:
+            prev_tweak, next_tweak, fac = self.get_tweak_blend(i, entry)
+
+            self.make_constraint(tweak, "COPY_TRANSFORMS", prev_tweak)
+            self.make_constraint(tweak, "COPY_TRANSFORMS", next_tweak, influence=fac)
+            self.make_constraint(tweak, "DAMPED_TRACK", next_tweak)
+        else:
+            self.make_constraint(tweak, "COPY_SCALE", self.bones.mch.follow, use_make_uniform=True)
+
+        if i == 0:
+            self.make_constraint(tweak, "COPY_LOCATION", entry.org)
+            self.make_constraint(tweak, "DAMPED_TRACK", entry.org, head_tail=1)
 
     def parent_org_chain(self):
         orgs = self.bones.org.main

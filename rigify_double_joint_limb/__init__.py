@@ -58,6 +58,10 @@ class RIGIFY_DOUBLE_JOINT_OT_duplicate_metarig(bpy.types.Operator):
         try:
             self._convert_metarig(context, duplicate)
         except Exception as exc:
+            # Bersihkan objek duplikat agar tidak tersisa sebagai orphan di scene
+            if context.object and context.object.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            bpy.data.objects.remove(duplicate, do_unlink=True)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         finally:
@@ -77,6 +81,13 @@ class RIGIFY_DOUBLE_JOINT_OT_duplicate_metarig(bpy.types.Operator):
         duplicate.animation_data_clear()
         duplicate.name = self._unique_name(source.name + "_double_joint")
         duplicate.data.name = self._unique_name(source.data.name + "_double_joint")
+
+        # Hapus referensi ke rig hasil generate milik metarig sumber.
+        # Tanpa ini, Rigify akan menimpa rig lama pengguna saat Generate Rig dipanggil
+        # pada metarig duplikat ini.
+        if hasattr(duplicate.data, "rigify_target_rig"):
+            duplicate.data.rigify_target_rig = None
+        duplicate.data.pop("rigify_target_rig", None)
 
         collection = source.users_collection[0] if source.users_collection else context.collection
         collection.objects.link(duplicate)
@@ -102,10 +113,15 @@ class RIGIFY_DOUBLE_JOINT_OT_duplicate_metarig(bpy.types.Operator):
             raise RuntimeError("No supported Rigify human arm or leg chains were found.")
 
         if hasattr(obj.data, "active_feature_set"):
-            obj.data.active_feature_set = FEATURE_SET_ID
+            try:
+                obj.data.active_feature_set = FEATURE_SET_ID
+            except (TypeError, ValueError):
+                pass
 
         self._assign_rig_types(obj, "L")
         self._assign_rig_types(obj, "R")
+
+
 
     def _convert_side(self, obj, side):
         arm = obj.data
@@ -164,13 +180,20 @@ class RIGIFY_DOUBLE_JOINT_OT_duplicate_metarig(bpy.types.Operator):
     def _assign_rig_types(self, obj, side):
         suffix = "." + side
 
-        self._assign_limb_type(obj, "upper_arm" + suffix, ARM_RIG_TYPE)
-        self._assign_limb_type(obj, "thigh" + suffix, LEG_RIG_TYPE)
+        # Hanya pasang rig type jika bone sendi benar-benar ada.
+        # Jika _insert_joint gagal (misalnya karena chain tidak lengkap, toe tidak ada,
+        # dsb.), kita tidak ingin memaksa rig type yang akan menyebabkan error saat Generate.
+        if ("elbow" + suffix) in obj.data.bones:
+            self._assign_limb_type(obj, "upper_arm" + suffix, ARM_RIG_TYPE)
+
+        if ("knee" + suffix) in obj.data.bones:
+            self._assign_limb_type(obj, "thigh" + suffix, LEG_RIG_TYPE)
 
         for name in ("elbow", "forearm", "hand", "knee", "shin", "foot", "toe"):
             pbone = obj.pose.bones.get(name + suffix)
             if pbone:
                 pbone.rigify_type = ""
+
 
     @staticmethod
     def _assign_limb_type(obj, bone_name, rig_type):
